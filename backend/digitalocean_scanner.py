@@ -38,6 +38,7 @@ class DigitalOceanScanner:
             "Content-Type": "application/json"
         }
         self.client = None
+        self._project_resource_cache: Dict[str, Dict[str, set]] = {}
 
     async def __aenter__(self):
         self.client = httpx.AsyncClient(timeout=REQUEST_TIMEOUT)
@@ -154,11 +155,48 @@ class DigitalOceanScanner:
             logger.error(f"Error fetching projects: {e}")
             raise
 
+    async def _get_project_resource_ids(self, project_id: str) -> Dict[str, set]:
+        """
+        Fetch all resource URNs for a project and parse into sets by resource type.
+        Results are cached per-instance so parallel get_* calls share one API round-trip.
+
+        DigitalOcean URN format: do:{type}:{id}
+          do:droplet:12345678      → type="droplet",     id="12345678"
+          do:volume:abc-uuid       → type="volume",      id="abc-uuid"
+          do:snapshot:snap-id      → type="snapshot",    id="snap-id"
+          do:dbaas:db-uuid         → type="dbaas",       id="db-uuid"
+          do:loadbalancer:lb-uuid  → type="loadbalancer",id="lb-uuid"
+          do:floatingip:1.2.3.4   → type="floatingip",  id="1.2.3.4"
+        """
+        if project_id in self._project_resource_cache:
+            return self._project_resource_cache[project_id]
+
+        raw = await self._paginate(f"/projects/{project_id}/resources", "resources")
+        ids_by_type: Dict[str, set] = {}
+        for r in raw:
+            urn = r.get("urn", "")
+            parts = urn.split(":")
+            if len(parts) == 3 and parts[0] == "do":
+                rtype, rid = parts[1], parts[2]
+                ids_by_type.setdefault(rtype, set()).add(rid)
+        logger.debug(
+            f"Project {project_id} resources: "
+            + ", ".join(f"{t}={len(ids)}" for t, ids in ids_by_type.items())
+        )
+        self._project_resource_cache[project_id] = ids_by_type
+        return ids_by_type
+
     async def get_droplets(self, project_id: str) -> List[Droplet]:
-        """Fetch all Droplets in a project (all pages)."""
+        """Fetch all Droplets belonging to a project."""
         try:
-            params = {"tag_name": f"project:{project_id}"} if project_id else {}
-            raw = await self._paginate("/droplets", "droplets", params)
+            if project_id:
+                ids = (await self._get_project_resource_ids(project_id)).get("droplet", set())
+                if not ids:
+                    logger.debug(f"No droplets found in project {project_id}")
+                    return []
+                raw = [d for d in await self._paginate("/droplets", "droplets") if str(d.get("id")) in ids]
+            else:
+                raw = await self._paginate("/droplets", "droplets")
             return [
                 Droplet(
                     id=str(d.get("id")),
@@ -178,10 +216,15 @@ class DigitalOceanScanner:
             raise
 
     async def get_volumes(self, project_id: str) -> List[Volume]:
-        """Fetch all Block Storage Volumes in a project (all pages)."""
+        """Fetch all Block Storage Volumes belonging to a project."""
         try:
-            params = {"tag_name": f"project:{project_id}"} if project_id else {}
-            raw = await self._paginate("/volumes", "volumes", params)
+            if project_id:
+                ids = (await self._get_project_resource_ids(project_id)).get("volume", set())
+                if not ids:
+                    return []
+                raw = [v for v in await self._paginate("/volumes", "volumes") if v.get("id") in ids]
+            else:
+                raw = await self._paginate("/volumes", "volumes")
             return [
                 Volume(
                     id=v.get("id"),
@@ -198,10 +241,15 @@ class DigitalOceanScanner:
             raise
 
     async def get_snapshots(self, project_id: str) -> List[Snapshot]:
-        """Fetch all Snapshots in a project (all pages)."""
+        """Fetch all Snapshots belonging to a project."""
         try:
-            params = {"tag_name": f"project:{project_id}"} if project_id else {}
-            raw = await self._paginate("/snapshots", "snapshots", params)
+            if project_id:
+                ids = (await self._get_project_resource_ids(project_id)).get("snapshot", set())
+                if not ids:
+                    return []
+                raw = [s for s in await self._paginate("/snapshots", "snapshots") if s.get("id") in ids]
+            else:
+                raw = await self._paginate("/snapshots", "snapshots")
             return [
                 Snapshot(
                     id=s.get("id"),
@@ -217,10 +265,16 @@ class DigitalOceanScanner:
             raise
 
     async def get_managed_databases(self, project_id: str) -> List[ManagedDatabase]:
-        """Fetch all Managed Databases in a project (all pages)."""
+        """Fetch all Managed Databases belonging to a project."""
         try:
-            params = {"tag_name": f"project:{project_id}"} if project_id else {}
-            raw = await self._paginate("/databases", "databases", params)
+            if project_id:
+                # DigitalOcean uses "dbaas" as the URN type for managed databases
+                ids = (await self._get_project_resource_ids(project_id)).get("dbaas", set())
+                if not ids:
+                    return []
+                raw = [db for db in await self._paginate("/databases", "databases") if db.get("id") in ids]
+            else:
+                raw = await self._paginate("/databases", "databases")
             return [
                 ManagedDatabase(
                     id=db.get("id"),
@@ -239,10 +293,15 @@ class DigitalOceanScanner:
             raise
 
     async def get_load_balancers(self, project_id: str) -> List[LoadBalancer]:
-        """Fetch all Load Balancers in a project (all pages)."""
+        """Fetch all Load Balancers belonging to a project."""
         try:
-            params = {"tag_name": f"project:{project_id}"} if project_id else {}
-            raw = await self._paginate("/load_balancers", "load_balancers", params)
+            if project_id:
+                ids = (await self._get_project_resource_ids(project_id)).get("loadbalancer", set())
+                if not ids:
+                    return []
+                raw = [lb for lb in await self._paginate("/load_balancers", "load_balancers") if lb.get("id") in ids]
+            else:
+                raw = await self._paginate("/load_balancers", "load_balancers")
             return [
                 LoadBalancer(
                     id=lb.get("id"),
@@ -258,10 +317,16 @@ class DigitalOceanScanner:
             raise
 
     async def get_floating_ips(self, project_id: str) -> List[FloatingIP]:
-        """Fetch all Floating IPs in a project (all pages)."""
+        """Fetch all Floating IPs belonging to a project."""
         try:
-            params = {"tag_name": f"project:{project_id}"} if project_id else {}
-            raw = await self._paginate("/floating_ips", "floating_ips", params)
+            if project_id:
+                # Floating IP URNs use the IP address as the ID: do:floatingip:1.2.3.4
+                ids = (await self._get_project_resource_ids(project_id)).get("floatingip", set())
+                if not ids:
+                    return []
+                raw = [fip for fip in await self._paginate("/floating_ips", "floating_ips") if fip.get("ip") in ids]
+            else:
+                raw = await self._paginate("/floating_ips", "floating_ips")
             floating_ips = []
             for fip in raw:
                 assigned_to = None

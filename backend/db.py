@@ -274,6 +274,14 @@ async def get_user_by_email(email: str) -> Optional[User]:
         return result.scalar_one_or_none()
 
 
+async def get_user_by_id(user_id: str) -> Optional[User]:
+    """Look up a user by primary key, returns None if not found."""
+    if _session_factory is None:
+        return None
+    async with _session_factory() as session:
+        return await session.get(User, user_id)
+
+
 async def get_all_users() -> List[User]:
     """Get all users ordered by created_at DESC."""
     if _session_factory is None:

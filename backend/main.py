@@ -1,14 +1,16 @@
+import asyncio
 import logging
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from fastapi import Depends, FastAPI, HTTPException, Query, WebSocket, WebSocketDisconnect, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from slowapi.errors import RateLimitExceeded
 
+from monitoring_scanner import MonitoringScanner
 from ai_analyzer import (
     AIAnalyzer, AIAnalysisError, AIAuthError, AIRateLimitError,
     AITimeoutError, AIMalformedResponseError,
@@ -34,6 +36,8 @@ from models import (
     AIAnalysisResult,
     AnalysisHistoryItem,
     HistoryListResponse,
+    MonitoringCoverageResponse,
+    MonitoringDropletItem,
     ProjectAnalysisRequest,
     ProjectAnalysisResponse,
     ProjectsListResponse,
@@ -124,6 +128,89 @@ async def get_projects(current_user: dict = Depends(get_current_user)):
         logger.error(f"Unexpected error fetching projects: {exc}", exc_info=True)
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR,
                             detail="Internal server error")
+
+
+# ── Monitoring Coverage ───────────────────────────────────────────────────────
+
+@app.get("/api/monitoring-coverage", response_model=MonitoringCoverageResponse)
+async def get_monitoring_coverage(
+    project_id: Optional[str] = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+):
+    """
+    Scan Droplets for monitoring agent coverage.
+
+    Optionally filter to a single project via ?project_id=<id>.  If omitted,
+    all Droplets in the account are scanned.
+
+    Returns summary counts and a per-Droplet monitoring status list.
+    The scan uses the DigitalOcean Monitoring API (CPU metrics endpoint with a
+    6-hour window): a non-empty result means the agent is installed and reporting.
+    """
+    if not config.DIGITALOCEAN_TOKEN:
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="DigitalOcean token not configured",
+        )
+
+    try:
+        async with DigitalOceanScanner(config.DIGITALOCEAN_TOKEN) as scanner:
+            droplets = await scanner.get_droplets(project_id or "")
+    except InvalidTokenError:
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid DigitalOcean API Token",
+        )
+    except RateLimitError:
+        raise HTTPException(
+            status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="DigitalOcean API rate limit exceeded",
+        )
+    except DigitalOceanAPIError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Failed to fetch Droplets for monitoring scan: {exc}", exc_info=True)
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to fetch Droplets",
+        )
+
+    if not droplets:
+        return MonitoringCoverageResponse(
+            total_droplets=0,
+            monitoring_enabled=0,
+            monitoring_missing=0,
+            monitoring_unknown=0,
+            droplets=[],
+        )
+
+    droplet_dicts = [d.dict() for d in droplets]
+    try:
+        results = await MonitoringScanner(config.DIGITALOCEAN_TOKEN).scan_all_droplets_monitoring(
+            droplet_dicts
+        )
+    except ValueError as exc:
+        # Invalid DO token detected by the monitoring API —  502 not 401 so the
+        # frontend's session-expiry interceptor (which acts on 401) is not triggered.
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail=str(exc))
+    except Exception as exc:
+        logger.error(f"Monitoring coverage scan failed: {exc}", exc_info=True)
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            detail="Monitoring coverage scan failed",
+        )
+
+    enabled = sum(1 for d in results if d["monitoring_status"] == "enabled")
+    missing = sum(1 for d in results if d["monitoring_status"] == "missing")
+    unknown = sum(1 for d in results if d["monitoring_status"] == "unknown")
+
+    return MonitoringCoverageResponse(
+        total_droplets=len(results),
+        monitoring_enabled=enabled,
+        monitoring_missing=missing,
+        monitoring_unknown=unknown,
+        droplets=[MonitoringDropletItem(**d) for d in results],
+    )
 
 
 # ── Analysis ID reservation ───────────────────────────────────────────────────
@@ -297,9 +384,39 @@ async def analyze_project(
         f"{len(resource_count) - 1} types"
     )
 
-    # ── Stage 9: Rule Engine ──────────────────────────────────────────────────
-    await ws_manager.send_progress(analysis_id, "Running Rule Engine...", stage=9)
-    rule_result = RuleEngine().run(resources, resource_count)
+    # ── Stage 9: Monitoring Coverage + Rule Engine ────────────────────────────
+    await ws_manager.send_progress(
+        analysis_id, "Checking Monitoring Coverage & Running Rule Engine...", stage=9
+    )
+
+    # Monitoring check is best-effort: a timeout or API error is logged and skipped,
+    # so the analysis pipeline always continues regardless of monitoring scan outcome.
+    monitoring_data: List[Dict] = []
+    droplet_dicts = [r for r in resources if r.get("type") == "droplet"]
+    if droplet_dicts:
+        try:
+            monitoring_data = await asyncio.wait_for(
+                MonitoringScanner(config.DIGITALOCEAN_TOKEN).scan_all_droplets_monitoring(
+                    droplet_dicts
+                ),
+                timeout=30.0,
+            )
+            missing_count = sum(1 for d in monitoring_data if d["monitoring_status"] == "missing")
+            unknown_count = sum(1 for d in monitoring_data if d["monitoring_status"] == "unknown")
+            logger.info(
+                f"[{analysis_id}] Monitoring check: {len(monitoring_data)} droplets, "
+                f"{missing_count} missing agent, {unknown_count} status unknown"
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[{analysis_id}] Monitoring scan timed out (30 s) — skipping for this analysis"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[{analysis_id}] Monitoring scan failed (non-fatal): {exc}"
+            )
+
+    rule_result = RuleEngine().run(resources, resource_count, monitoring_data=monitoring_data)
     preliminary_findings = rule_result["findings"]
     logger.info(
         f"[{analysis_id}] Rule Engine complete — "

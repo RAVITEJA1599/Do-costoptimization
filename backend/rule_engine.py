@@ -5,7 +5,7 @@ Each rule returns zero or more finding dicts (no savings estimates — Claude ad
 """
 import logging
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +15,7 @@ class RuleEngine:
         self,
         resources: List[Dict[str, Any]],
         resource_count: Dict[str, int],
+        monitoring_data: Optional[List[Dict[str, Any]]] = None,
     ) -> Dict[str, Any]:
         """
         Run all rules against the normalised resource inventory.
@@ -33,6 +34,8 @@ class RuleEngine:
         findings += self._rule_over_provisioned_droplets(by_type.get("droplet", []))
         findings += self._rule_large_databases(by_type.get("database", []))
         findings += self._rule_idle_load_balancers(by_type.get("load_balancer", []))
+        if monitoring_data:
+            findings += self._rule_no_monitoring(monitoring_data)
 
         logger.info(
             f"Rule Engine: {len(findings)} preliminary findings "
@@ -209,6 +212,28 @@ class RuleEngine:
                     severity="high",
                     issue="Idle Load Balancer with no attached Droplets — billed at $12/month with no traffic handled",
                     recommendation="Delete the Load Balancer if unused, or attach active Droplets to justify the cost",
+                    confidence="high",
+                ))
+        return out
+
+    def _rule_no_monitoring(self, monitoring_data: List[Dict]) -> List[Dict]:
+        out = []
+        for d in monitoring_data:
+            # Only flag confirmed-missing; "unknown" means the check failed transiently
+            if d.get("monitoring_status") == "missing":
+                out.append(self._f(
+                    resource_name=d.get("droplet_name", "unknown"),
+                    resource_type="droplet",
+                    severity="high",
+                    issue=(
+                        "DigitalOcean Monitoring Agent not enabled — CPU, memory, and disk metrics "
+                        "are unavailable; alerts cannot be configured for this Droplet"
+                    ),
+                    recommendation=(
+                        "Install the DigitalOcean Monitoring Agent via SSH: "
+                        "curl -sSL https://repos.sonar.digitalocean.com/install.sh | sudo bash. "
+                        "See: https://docs.digitalocean.com/products/monitoring/quickstart/"
+                    ),
                     confidence="high",
                 ))
         return out

@@ -7,7 +7,7 @@ import MockBanner from '../components/MockBanner'
 import AnalysisModeSelector from '../components/AnalysisModeSelector'
 import api from '../services/api'
 import { authService } from '../services/auth'
-import type { AnalysisResult, AnalysisStatus, HistoryItem, Project } from '../types/analysis'
+import type { AnalysisResult, AnalysisStatus, HistoryItem, MonitoringCoverageData, Project } from '../types/analysis'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -108,6 +108,10 @@ export default function Dashboard() {
 
   const [historyItems, setHistoryItems] = useState<HistoryItem[]>([])
   const [loadingHistory, setLoadingHistory] = useState(true)
+
+  const [monitoringData, setMonitoringData] = useState<MonitoringCoverageData | null>(null)
+  const [monitoringLoading, setMonitoringLoading] = useState(false)
+  const [monitoringError, setMonitoringError] = useState('')
 
   const analysisRef = useRef<AbortController | null>(null)
   const navigate = useNavigate()
@@ -210,6 +214,30 @@ export default function Dashboard() {
     () => historyItems.filter((i) => i.status === 'completed').slice(0, 5),
     [historyItems],
   )
+
+  const handleScanMonitoring = useCallback(async () => {
+    if (!selectedProject) return
+    setMonitoringLoading(true)
+    setMonitoringError('')
+    setMonitoringData(null)
+    try {
+      const { data } = await api.get<MonitoringCoverageData>(
+        `/monitoring-coverage?project_id=${encodeURIComponent(selectedProject)}`
+      )
+      // Sort: missing first (actionable), then unknown, then enabled; alphabetical within groups
+      const s = (status: string) => ({ missing: 0, unknown: 1, enabled: 2 }[status] ?? 1)
+      data.droplets.sort((a, b) => {
+        const diff = s(a.monitoring_status) - s(b.monitoring_status)
+        return diff !== 0 ? diff : a.droplet_name.localeCompare(b.droplet_name)
+      })
+      setMonitoringData(data)
+    } catch (err: unknown) {
+      const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail
+      setMonitoringError(detail ?? 'Failed to scan monitoring coverage.')
+    } finally {
+      setMonitoringLoading(false)
+    }
+  }, [selectedProject])
 
   const projectName = projects.find((p) => p.id === selectedProject)?.name ?? ''
 
@@ -447,6 +475,140 @@ export default function Dashboard() {
             </p>
           </div>
         )}
+
+        {/* Monitoring Coverage — always visible; scan is triggered manually */}
+        <div className="card p-5">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h2 className="text-sm font-semibold text-slate-100">Monitoring Coverage</h2>
+              <p className="text-xs text-slate-400 mt-0.5">
+                Check which Droplets have the DigitalOcean Monitoring Agent installed
+              </p>
+            </div>
+            <button
+              onClick={handleScanMonitoring}
+              disabled={!selectedProject || monitoringLoading || loadingProjects}
+              className="btn-ghost text-sm flex items-center gap-1.5 shrink-0"
+            >
+              {monitoringLoading ? (
+                <>
+                  <svg className="animate-spin w-3.5 h-3.5" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"/>
+                    <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
+                  </svg>
+                  Scanning...
+                </>
+              ) : (
+                <>
+                  <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
+                      d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
+                  </svg>
+                  Scan Coverage
+                </>
+              )}
+            </button>
+          </div>
+
+          {monitoringError && (
+            <div className="bg-red-500/10 border border-red-500/30 rounded-lg px-3 py-2 mb-4">
+              <p className="text-red-400 text-sm">{monitoringError}</p>
+            </div>
+          )}
+
+          {monitoringData ? (
+            <div className="space-y-4">
+              {/* Summary cards */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <div className="bg-slate-800/60 rounded-lg p-3 text-center">
+                  <p className="text-lg font-bold text-slate-100">{monitoringData.total_droplets}</p>
+                  <p className="text-xs text-slate-400 mt-0.5">Total Droplets</p>
+                </div>
+                <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-lg p-3 text-center">
+                  <p className="text-lg font-bold text-emerald-400">{monitoringData.monitoring_enabled}</p>
+                  <p className="text-xs text-slate-400 mt-0.5">Monitoring Enabled</p>
+                </div>
+                <div className={`rounded-lg p-3 text-center border ${
+                  monitoringData.monitoring_missing > 0
+                    ? 'bg-red-500/10 border-red-500/20'
+                    : 'bg-slate-800/60 border-slate-700/50'
+                }`}>
+                  <p className={`text-lg font-bold ${
+                    monitoringData.monitoring_missing > 0 ? 'text-red-400' : 'text-slate-400'
+                  }`}>
+                    {monitoringData.monitoring_missing}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-0.5">Agent Missing</p>
+                </div>
+                <div className={`rounded-lg p-3 text-center border ${
+                  monitoringData.monitoring_unknown > 0
+                    ? 'bg-amber-500/10 border-amber-500/20'
+                    : 'bg-slate-800/60 border-slate-700/50'
+                }`}>
+                  <p className={`text-lg font-bold ${
+                    monitoringData.monitoring_unknown > 0 ? 'text-amber-400' : 'text-slate-400'
+                  }`}>
+                    {monitoringData.monitoring_unknown}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-0.5">Status Unknown</p>
+                </div>
+              </div>
+
+              {/* Droplet table */}
+              {monitoringData.total_droplets === 0 ? (
+                <p className="text-sm text-slate-500 text-center py-2">No Droplets found in this project.</p>
+              ) : (
+                <div className="border border-slate-700/50 rounded-lg overflow-hidden">
+                  <div className="max-h-60 overflow-y-auto">
+                    <table className="w-full text-sm">
+                      <thead className="sticky top-0 bg-slate-800/90 backdrop-blur-sm">
+                        <tr className="border-b border-slate-700/70">
+                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                            Droplet Name
+                          </th>
+                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                            Monitoring Status
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-700/40">
+                        {monitoringData.droplets.map((d) => (
+                          <tr key={d.droplet_id} className="hover:bg-slate-700/20 transition-colors">
+                            <td className="px-3 py-2 text-slate-300 font-mono text-xs">{d.droplet_name}</td>
+                            <td className="px-3 py-2">
+                              {d.monitoring_status === 'enabled' ? (
+                                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+                                  Enabled
+                                </span>
+                              ) : d.monitoring_status === 'missing' ? (
+                                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/10 border border-red-500/20 text-red-400">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
+                                  Missing
+                                </span>
+                              ) : (
+                                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 border border-amber-500/20 text-amber-400">
+                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+                                  Unknown
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : !monitoringLoading && (
+            <p className="text-sm text-slate-500 text-center py-3">
+              {selectedProject
+                ? 'Click "Scan Coverage" to check monitoring agent status across your Droplets.'
+                : 'Select a project to scan monitoring coverage.'}
+            </p>
+          )}
+        </div>
 
       </main>
     </div>

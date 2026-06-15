@@ -13,7 +13,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel
 
 from config import config
-from db import create_user, get_user_by_email, get_all_users, delete_user, update_user_password
+from db import create_user, get_user_by_email, get_user_by_id, get_all_users, delete_user, update_user_password
 from models import UsersListResponse, UserItem
 from rate_limiter import limiter
 
@@ -82,11 +82,16 @@ async def get_current_user(
     if not credentials:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
     try:
-        return _decode_token(credentials.credentials)
+        payload = _decode_token(credentials.credentials)
     except jwt.ExpiredSignatureError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Token has expired")
     except jwt.InvalidTokenError:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Invalid token")
+
+    user = await get_user_by_id(payload.get("user_id", ""))
+    if not user:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Session expired, please log in again")
+    return payload
 
 
 async def get_current_user_optional(

@@ -170,3 +170,19 @@ class ErrorResponse(BaseModel):
     error: str
     status_code: int = 400
     details: Optional[str] = None
+
+
+# ── Monitoring coverage models ─────────────────────────────────────────────────
+
+class MonitoringDropletItem(BaseModel):
+    droplet_id: str
+    droplet_name: str
+    monitoring_status: str  # "enabled" | "missing" | "unknown"
+
+
+class MonitoringCoverageResponse(BaseModel):
+    total_droplets: int
+    monitoring_enabled: int
+    monitoring_missing: int
+    monitoring_unknown: int
+    droplets: List[MonitoringDropletItem]

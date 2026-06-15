@@ -57,6 +57,25 @@ class MockAnalyzer:
         findings += self._inactive_droplets(by_type.get("droplet", []))
         findings += self._oversized_droplets(by_type.get("droplet", []))
 
+        # Append monitoring findings from the rule engine (confirmed-missing droplets only)
+        if preliminary_findings:
+            for pf in preliminary_findings:
+                if pf.get("issue", "").startswith("DigitalOcean Monitoring Agent not enabled"):
+                    findings.append(_finding(
+                        name=pf["resource_name"],
+                        rtype="droplet",
+                        severity=pf.get("severity", "high"),
+                        issue=pf["issue"],
+                        monthly=0,
+                        recommendation=pf["recommendation"],
+                        steps=[
+                            "Connect to the Droplet via SSH",
+                            "Run: curl -sSL https://repos.sonar.digitalocean.com/install.sh | sudo bash",
+                            "Verify agent is running: sudo systemctl status do-agent",
+                            "Metrics will appear in the DigitalOcean Monitoring dashboard within a few minutes",
+                        ],
+                    ))
+
         monthly = sum(_dollars(f["monthly_savings"]) for f in findings)
         annual = monthly * 12
 

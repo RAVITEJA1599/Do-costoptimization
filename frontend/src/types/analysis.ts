@@ -70,3 +70,19 @@ export interface ProgressMessage {
 }
 
 export type AnalysisStatus = 'idle' | 'scanning' | 'complete' | 'error'
+
+// ── Monitoring coverage types ──────────────────────────────────────────────────
+
+export interface MonitoringDropletItem {
+  droplet_id: string
+  droplet_name: string
+  monitoring_status: 'enabled' | 'missing' | 'unknown'
+}
+
+export interface MonitoringCoverageData {
+  total_droplets: number
+  monitoring_enabled: number
+  monitoring_missing: number
+  monitoring_unknown: number
+  droplets: MonitoringDropletItem[]
+}
