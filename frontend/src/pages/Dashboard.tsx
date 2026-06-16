@@ -7,7 +7,7 @@ import MockBanner from '../components/MockBanner'
 import AnalysisModeSelector from '../components/AnalysisModeSelector'
 import api from '../services/api'
 import { authService } from '../services/auth'
-import type { AnalysisResult, AnalysisStatus, HistoryItem, MonitoringCoverageData, Project } from '../types/analysis'
+import type { AnalysisResult, AnalysisStatus, HistoryItem, MonitoringCoverageData, MonitoringDropletItem, Project } from '../types/analysis'
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -92,6 +92,89 @@ function RecentAnalyses({ items }: { items: HistoryItem[] }) {
       </div>
     </div>
   )
+}
+
+// ── Fleet Health sub-components ───────────────────────────────────────────────
+
+const ENV_STYLES: Record<string, string> = {
+  PROD:    'bg-rose-500/15 border-rose-500/30 text-rose-400',
+  STAGING: 'bg-orange-500/15 border-orange-500/30 text-orange-400',
+  QA:      'bg-amber-500/15 border-amber-500/30 text-amber-400',
+  DEV:     'bg-slate-700/60 border-slate-600/40 text-slate-400',
+}
+
+function EnvBadge({ env }: { env: string }) {
+  const cls = ENV_STYLES[env] ?? 'bg-slate-700/60 border-slate-600/40 text-slate-500'
+  return (
+    <span className={`inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium border ${cls}`}>
+      {env === 'unknown' ? '—' : env}
+    </span>
+  )
+}
+
+function AgentBadge({ status }: { status: string }) {
+  if (status === 'enabled') {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-emerald-400">
+        <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
+        On
+      </span>
+    )
+  }
+  if (status === 'missing') {
+    return (
+      <span className="inline-flex items-center gap-1 text-xs text-red-400">
+        <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
+        Missing
+      </span>
+    )
+  }
+  return (
+    <span className="inline-flex items-center gap-1 text-xs text-amber-400">
+      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
+      Unknown
+    </span>
+  )
+}
+
+function MetricCell({
+  value,
+  warnAt,
+  critAt,
+}: {
+  value: number | null | undefined
+  warnAt: number
+  critAt: number
+}) {
+  if (value == null) return <span className="text-slate-600 text-xs">—</span>
+  const pct = Math.round(value)
+  let cls = 'text-slate-400'
+  if (pct >= critAt) cls = 'text-red-400 font-medium'
+  else if (pct >= warnAt) cls = 'text-amber-400'
+  return <span className={`text-xs tabular-nums ${cls}`}>{pct}%</span>
+}
+
+function fleetSortKey(d: MonitoringDropletItem): number {
+  const disk    = d.disk_percent    ?? 0
+  const mem     = d.memory_percent  ?? 0
+  const isProd  = d.environment === 'PROD'
+  const missing = d.monitoring_status === 'missing'
+
+  if (isProd && (disk > 85 || mem > 90)) return 0  // PROD + critical metric
+  if (disk > 85)                          return 1  // high disk — hard-fail risk
+  if (isProd && missing)                  return 2  // PROD with no visibility
+  if (mem > 90)                           return 3  // high memory
+  if (missing)                            return 4  // no visibility
+  if (mem > 75 || disk > 70)             return 5  // elevated but not critical
+  if (d.monitoring_status === 'unknown')  return 6  // uncertain
+  return 7                                          // healthy
+}
+
+function sortedFleetDroplets(droplets: MonitoringDropletItem[]): MonitoringDropletItem[] {
+  return [...droplets].sort((a, b) => {
+    const diff = fleetSortKey(a) - fleetSortKey(b)
+    return diff !== 0 ? diff : a.droplet_name.localeCompare(b.droplet_name)
+  })
 }
 
 // ── Main page ──────────────────────────────────────────────────────────────────
@@ -224,16 +307,10 @@ export default function Dashboard() {
       const { data } = await api.get<MonitoringCoverageData>(
         `/monitoring-coverage?project_id=${encodeURIComponent(selectedProject)}`
       )
-      // Sort: missing first (actionable), then unknown, then enabled; alphabetical within groups
-      const s = (status: string) => ({ missing: 0, unknown: 1, enabled: 2 }[status] ?? 1)
-      data.droplets.sort((a, b) => {
-        const diff = s(a.monitoring_status) - s(b.monitoring_status)
-        return diff !== 0 ? diff : a.droplet_name.localeCompare(b.droplet_name)
-      })
       setMonitoringData(data)
     } catch (err: unknown) {
       const detail = (err as { response?: { data?: { detail?: string } } }).response?.data?.detail
-      setMonitoringError(detail ?? 'Failed to scan monitoring coverage.')
+      setMonitoringError(detail ?? 'Failed to scan fleet health.')
     } finally {
       setMonitoringLoading(false)
     }
@@ -476,13 +553,13 @@ export default function Dashboard() {
           </div>
         )}
 
-        {/* Monitoring Coverage — always visible; scan is triggered manually */}
+        {/* Fleet Health — always visible; scan is triggered manually */}
         <div className="card p-5">
           <div className="flex items-center justify-between mb-4">
             <div>
-              <h2 className="text-sm font-semibold text-slate-100">Monitoring Coverage</h2>
+              <h2 className="text-sm font-semibold text-slate-100">Fleet Health</h2>
               <p className="text-xs text-slate-400 mt-0.5">
-                Check which Droplets have the DigitalOcean Monitoring Agent installed
+                Memory, disk, and monitoring agent status across your Droplets
               </p>
             </div>
             <button
@@ -504,7 +581,7 @@ export default function Dashboard() {
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                       d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z"/>
                   </svg>
-                  Scan Coverage
+                  Scan Fleet Health
                 </>
               )}
             </button>
@@ -518,15 +595,11 @@ export default function Dashboard() {
 
           {monitoringData ? (
             <div className="space-y-4">
-              {/* Summary cards */}
+              {/* Summary cards: Total | No Agent | High Disk | High Memory */}
               <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
                 <div className="bg-slate-800/60 rounded-lg p-3 text-center">
                   <p className="text-lg font-bold text-slate-100">{monitoringData.total_droplets}</p>
                   <p className="text-xs text-slate-400 mt-0.5">Total Droplets</p>
-                </div>
-                <div className="bg-emerald-500/10 border border-emerald-500/20 rounded-lg p-3 text-center">
-                  <p className="text-lg font-bold text-emerald-400">{monitoringData.monitoring_enabled}</p>
-                  <p className="text-xs text-slate-400 mt-0.5">Monitoring Enabled</p>
                 </div>
                 <div className={`rounded-lg p-3 text-center border ${
                   monitoringData.monitoring_missing > 0
@@ -538,19 +611,31 @@ export default function Dashboard() {
                   }`}>
                     {monitoringData.monitoring_missing}
                   </p>
-                  <p className="text-xs text-slate-400 mt-0.5">Agent Missing</p>
+                  <p className="text-xs text-slate-400 mt-0.5">No Agent</p>
                 </div>
                 <div className={`rounded-lg p-3 text-center border ${
-                  monitoringData.monitoring_unknown > 0
+                  monitoringData.high_disk > 0
+                    ? 'bg-red-500/10 border-red-500/20'
+                    : 'bg-slate-800/60 border-slate-700/50'
+                }`}>
+                  <p className={`text-lg font-bold ${
+                    monitoringData.high_disk > 0 ? 'text-red-400' : 'text-slate-400'
+                  }`}>
+                    {monitoringData.high_disk}
+                  </p>
+                  <p className="text-xs text-slate-400 mt-0.5">High Disk &gt;85%</p>
+                </div>
+                <div className={`rounded-lg p-3 text-center border ${
+                  monitoringData.high_memory > 0
                     ? 'bg-amber-500/10 border-amber-500/20'
                     : 'bg-slate-800/60 border-slate-700/50'
                 }`}>
                   <p className={`text-lg font-bold ${
-                    monitoringData.monitoring_unknown > 0 ? 'text-amber-400' : 'text-slate-400'
+                    monitoringData.high_memory > 0 ? 'text-amber-400' : 'text-slate-400'
                   }`}>
-                    {monitoringData.monitoring_unknown}
+                    {monitoringData.high_memory}
                   </p>
-                  <p className="text-xs text-slate-400 mt-0.5">Status Unknown</p>
+                  <p className="text-xs text-slate-400 mt-0.5">High Mem &gt;85%</p>
                 </div>
               </div>
 
@@ -559,39 +644,44 @@ export default function Dashboard() {
                 <p className="text-sm text-slate-500 text-center py-2">No Droplets found in this project.</p>
               ) : (
                 <div className="border border-slate-700/50 rounded-lg overflow-hidden">
-                  <div className="max-h-60 overflow-y-auto">
+                  <div className="max-h-72 overflow-y-auto">
                     <table className="w-full text-sm">
                       <thead className="sticky top-0 bg-slate-800/90 backdrop-blur-sm">
                         <tr className="border-b border-slate-700/70">
                           <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                            Droplet Name
+                            Droplet
+                          </th>
+                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider hidden sm:table-cell">
+                            Env
                           </th>
                           <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                            Monitoring Status
+                            Agent
+                          </th>
+                          <th className="text-right px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">
+                            Memory
+                          </th>
+                          <th className="text-right px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                            Disk
                           </th>
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-700/40">
-                        {monitoringData.droplets.map((d) => (
+                        {sortedFleetDroplets(monitoringData.droplets).map((d) => (
                           <tr key={d.droplet_id} className="hover:bg-slate-700/20 transition-colors">
-                            <td className="px-3 py-2 text-slate-300 font-mono text-xs">{d.droplet_name}</td>
+                            <td className="px-3 py-2 text-slate-300 font-mono text-xs max-w-[160px] truncate" title={d.droplet_name}>
+                              {d.droplet_name}
+                            </td>
+                            <td className="px-3 py-2 hidden sm:table-cell">
+                              <EnvBadge env={d.environment ?? 'unknown'} />
+                            </td>
                             <td className="px-3 py-2">
-                              {d.monitoring_status === 'enabled' ? (
-                                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-500/10 border border-emerald-500/20 text-emerald-400">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 shrink-0" />
-                                  Enabled
-                                </span>
-                              ) : d.monitoring_status === 'missing' ? (
-                                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-red-500/10 border border-red-500/20 text-red-400">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-red-400 shrink-0" />
-                                  Missing
-                                </span>
-                              ) : (
-                                <span className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-full text-xs font-medium bg-amber-500/10 border border-amber-500/20 text-amber-400">
-                                  <span className="w-1.5 h-1.5 rounded-full bg-amber-400 shrink-0" />
-                                  Unknown
-                                </span>
-                              )}
+                              <AgentBadge status={d.monitoring_status} />
+                            </td>
+                            <td className="px-3 py-2 text-right hidden md:table-cell">
+                              <MetricCell value={d.memory_percent} warnAt={75} critAt={90} />
+                            </td>
+                            <td className="px-3 py-2 text-right">
+                              <MetricCell value={d.disk_percent} warnAt={70} critAt={85} />
                             </td>
                           </tr>
                         ))}
@@ -600,12 +690,29 @@ export default function Dashboard() {
                   </div>
                 </div>
               )}
+
+              {/* Footer summary */}
+              <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-slate-500">
+                <span>{monitoringData.total_droplets} droplets</span>
+                {monitoringData.high_disk > 0 && (
+                  <span className="text-red-400">{monitoringData.high_disk} high disk</span>
+                )}
+                {monitoringData.high_memory > 0 && (
+                  <span className="text-amber-400">{monitoringData.high_memory} high memory</span>
+                )}
+                {monitoringData.monitoring_missing > 0 && (
+                  <span className="text-red-400">{monitoringData.monitoring_missing} missing agent</span>
+                )}
+                {monitoringData.monitoring_unknown > 0 && (
+                  <span>{monitoringData.monitoring_unknown} status unknown</span>
+                )}
+              </div>
             </div>
           ) : !monitoringLoading && (
             <p className="text-sm text-slate-500 text-center py-3">
               {selectedProject
-                ? 'Click "Scan Coverage" to check monitoring agent status across your Droplets.'
-                : 'Select a project to scan monitoring coverage.'}
+                ? 'Click "Scan Fleet Health" to check memory, disk, and agent status.'
+                : 'Select a project to scan fleet health.'}
             </p>
           )}
         </div>

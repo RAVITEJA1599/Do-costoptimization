@@ -71,12 +71,15 @@ export interface ProgressMessage {
 
 export type AnalysisStatus = 'idle' | 'scanning' | 'complete' | 'error'
 
-// ── Monitoring coverage types ──────────────────────────────────────────────────
+// ── Fleet Health / Monitoring coverage types ───────────────────────────────────
 
 export interface MonitoringDropletItem {
   droplet_id: string
   droplet_name: string
   monitoring_status: 'enabled' | 'missing' | 'unknown'
+  memory_percent?: number | null   // 0–100; null when agent absent or coverage_only
+  disk_percent?: number | null     // 0–100; max across partitions
+  environment?: string             // "PROD" | "DEV" | "QA" | "STAGING" | "unknown"
 }
 
 export interface MonitoringCoverageData {
@@ -84,5 +87,7 @@ export interface MonitoringCoverageData {
   monitoring_enabled: number
   monitoring_missing: number
   monitoring_unknown: number
+  high_memory: number   // droplets with memory_percent > 85
+  high_disk: number     // droplets with disk_percent > 85
   droplets: MonitoringDropletItem[]
 }
