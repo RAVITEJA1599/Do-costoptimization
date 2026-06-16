@@ -172,12 +172,15 @@ class ErrorResponse(BaseModel):
     details: Optional[str] = None
 
 
-# ── Monitoring coverage models ─────────────────────────────────────────────────
+# ── Fleet Health / Monitoring coverage models ──────────────────────────────────
 
 class MonitoringDropletItem(BaseModel):
     droplet_id: str
     droplet_name: str
-    monitoring_status: str  # "enabled" | "missing" | "unknown"
+    monitoring_status: str          # "enabled" | "missing" | "unknown"
+    memory_percent: Optional[float] = None  # 0.0–100.0; None when agent absent or coverage_only
+    disk_percent: Optional[float] = None    # 0.0–100.0; max across partitions
+    environment: str = "unknown"            # "PROD" | "DEV" | "QA" | "STAGING" | "unknown"
 
 
 class MonitoringCoverageResponse(BaseModel):
@@ -185,4 +188,6 @@ class MonitoringCoverageResponse(BaseModel):
     monitoring_enabled: int
     monitoring_missing: int
     monitoring_unknown: int
+    high_memory: int = 0   # droplets with memory_percent > 85
+    high_disk: int = 0     # droplets with disk_percent > 85
     droplets: List[MonitoringDropletItem]

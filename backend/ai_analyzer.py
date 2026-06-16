@@ -5,6 +5,7 @@ import re
 from typing import Any, Dict, List, Optional
 
 import anthropic
+from rule_engine import _detect_effective_environment
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +16,11 @@ SYSTEM_PROMPT = """You are a Senior Cloud FinOps Engineer specializing in Digita
 
 Analyze the provided resource inventory and identify cost inefficiencies. Focus on:
 
-1. **Over-provisioned Droplets** — resources sized far above what the workload needs
+1. **Over-provisioned Droplets** — resources sized far above what the workload needs.
+   Each Droplet in the inventory includes an `env=` field (e.g. env=PROD, env=DEV).
+   This is pre-computed from the droplet's DigitalOcean tags and name segments — it is authoritative.
+   Do NOT flag a Droplet as over-provisioned when env=PROD or env=DR.
+   Large instances in production and disaster-recovery environments are expected and intentional.
 2. **Unattached Volumes** — block storage not mounted to any Droplet (billed at $0.10/GB/month)
 3. **Stale Snapshots** — snapshots older than 30 days that are accumulating storage costs
 4. **Snapshot Sprawl** — more than 3 snapshots per resource without a clear retention policy
@@ -176,10 +181,11 @@ class AIAnalyzer:
             for d in by_type["droplet"]:
                 memory_gb = round(d.get("memory", 0) / 1024, 1)
                 tags = ", ".join(d.get("tags", [])) or "none"
+                env = _detect_effective_environment(d.get("name", ""), d.get("tags"))
                 lines.append(
                     f"  - {d['name']} | region={d.get('region')} | "
                     f"{d.get('vcpus')} vCPU / {memory_gb}GB RAM / {d.get('disk')}GB disk | "
-                    f"status={d.get('status')} | tags=[{tags}]"
+                    f"status={d.get('status')} | tags=[{tags}] | env={env}"
                 )
 
         # Volumes

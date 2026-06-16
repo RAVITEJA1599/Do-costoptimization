@@ -2,12 +2,80 @@
 Rule Engine: deterministic pre-AI cost analysis.
 Detects obvious cost issues before Claude to reduce token usage and hallucinations.
 Each rule returns zero or more finding dicts (no savings estimates — Claude adds those).
+
+Environment detection
+─────────────────────
+Rules that could be false positives on production systems (over-provisioned droplets,
+large DB clusters) use _detect_effective_environment() before emitting a finding.
+Detection is tag-first, name-segment fallback, case-insensitive.
+
+Suppressed environments: PROD, DR — large instances are operationally justified.
+All other environments (DEV, QA, STAGING, UAT, DEMO, TEST, POC, BACKUP, UNKNOWN)
+still receive the finding because over-provisioning is actionable in those contexts.
 """
 import logging
+import re
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, FrozenSet, List, Optional
 
 logger = logging.getLogger(__name__)
+
+# Maps a lowercase tag value or name segment to a canonical environment label.
+_ENV_MAP: Dict[str, str] = {
+    "prod":        "PROD",
+    "production":  "PROD",
+    "dev":         "DEV",
+    "development": "DEV",
+    "qa":          "QA",
+    "staging":     "STAGING",
+    "stage":       "STAGING",
+    "stg":         "STAGING",
+    "uat":         "UAT",
+    "demo":        "DEMO",
+    "test":        "TEST",
+    "testing":     "TEST",
+    "poc":         "POC",
+    "dr":          "DR",
+    "backup":      "BACKUP",
+}
+
+# Environments where large instances are operationally justified.
+# Over-provisioning and large-DB warnings are suppressed for these.
+_PROD_LIKE_ENVS: FrozenSet[str] = frozenset({"PROD", "DR"})
+
+# Separator characters used to split a resource name into segments.
+_NAME_SEP = re.compile(r"[-_.\s]+")
+
+
+def _detect_effective_environment(
+    name: str,
+    tags: Optional[List[str]] = None,
+) -> str:
+    """
+    Return the effective environment for a resource.
+
+    Priority:
+      1. First matching tag (explicit intent — highest priority)
+      2. First matching segment of the resource name (tag-free fallback)
+      3. "UNKNOWN" when neither yields a match
+
+    Segment splitting: name is split on [-_. ] so "SD-Dms-PROD" yields
+    ["SD", "Dms", "PROD"] and the third segment maps to "PROD".
+
+    Returns one of:
+      PROD | DR | DEV | QA | STAGING | UAT | DEMO | TEST | POC | BACKUP | UNKNOWN
+    """
+    for tag in (tags or []):
+        env = _ENV_MAP.get(tag.lower())
+        if env:
+            return env
+
+    for segment in _NAME_SEP.split(name):
+        env = _ENV_MAP.get(segment.lower())
+        if env:
+            return env
+
+    return "UNKNOWN"
 
 
 class RuleEngine:
@@ -164,42 +232,65 @@ class RuleEngine:
         return out
 
     def _rule_over_provisioned_droplets(self, droplets: List[Dict]) -> List[Dict]:
+        """
+        Flag large droplets (≥8 vCPU or ≥16 GB RAM) that may be over-provisioned.
+
+        Suppressed for PROD and DR environments — large instances are expected there.
+        Uses effective environment detection (tag-first, name-fallback) so that a
+        droplet named SD-Dms-PROD is correctly classified as PROD even without an
+        explicit 'production' tag.
+        """
         out = []
         for d in droplets:
             vcpus = d.get("vcpus", 0)
             memory = d.get("memory", 0)
-            if vcpus >= 8 or memory >= 16384:
-                mem_gb = round(memory / 1024, 1)
-                out.append(self._f(
-                    resource_name=d.get("name", "unknown"),
-                    resource_type="droplet",
-                    severity="medium",
-                    issue=(
-                        f"Potentially over-provisioned Droplet ({vcpus} vCPU / {mem_gb} GB RAM) — "
-                        "large instance that may be underutilised (utilisation metrics not available)"
-                    ),
-                    recommendation="Review CPU and memory utilisation; downsize if average usage is consistently below 30%",
-                    confidence="low",
-                ))
+            if not (vcpus >= 8 or memory >= 16384):
+                continue
+            env = _detect_effective_environment(d.get("name", ""), d.get("tags"))
+            if env in _PROD_LIKE_ENVS:
+                continue
+            mem_gb = round(memory / 1024, 1)
+            out.append(self._f(
+                resource_name=d.get("name", "unknown"),
+                resource_type="droplet",
+                severity="medium",
+                issue=(
+                    f"Potentially over-provisioned Droplet ({vcpus} vCPU / {mem_gb} GB RAM) — "
+                    "large instance that may be underutilised (utilisation metrics not available)"
+                ),
+                recommendation="Review CPU and memory utilisation; downsize if average usage is consistently below 30%",
+                confidence="low",
+            ))
         return out
 
     def _rule_large_databases(self, databases: List[Dict]) -> List[Dict]:
+        """
+        Flag managed database clusters with ≥3 nodes that may be over-sized.
+
+        Suppressed for PROD and DR environments where multi-node HA is expected.
+        Environment is detected from the database name (DO managed databases have
+        no tags in the resource model).
+        """
         out = []
         for db in databases:
             nodes = db.get("num_nodes", 0)
-            if nodes >= 3:
-                out.append(self._f(
-                    resource_name=db.get("name", "unknown"),
-                    resource_type="database",
-                    severity="medium",
-                    issue=(
-                        f"Large Managed Database cluster ({nodes} nodes, "
-                        f"{db.get('engine')} {db.get('version')}) — "
-                        "multi-node clusters are expensive and may be oversized for the workload"
-                    ),
-                    recommendation="Review if high-availability is required; consider fewer nodes for non-production environments",
-                    confidence="medium",
-                ))
+            if nodes < 3:
+                continue
+            env = _detect_effective_environment(db.get("name", ""), db.get("tags"))
+            if env in _PROD_LIKE_ENVS:
+                continue
+            out.append(self._f(
+                resource_name=db.get("name", "unknown"),
+                resource_type="database",
+                severity="medium",
+                issue=(
+                    f"Large Managed Database cluster ({nodes} nodes, "
+                    f"{db.get('engine')} {db.get('version')}) — "
+                    "multi-node clusters are expensive and may be oversized for the workload"
+                ),
+                recommendation="Review if high-availability is required; consider fewer nodes for non-production environments",
+                confidence="medium",
+            ))
         return out
 
     def _rule_idle_load_balancers(self, load_balancers: List[Dict]) -> List[Dict]:

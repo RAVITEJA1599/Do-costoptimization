@@ -203,12 +203,16 @@ async def get_monitoring_coverage(
     enabled = sum(1 for d in results if d["monitoring_status"] == "enabled")
     missing = sum(1 for d in results if d["monitoring_status"] == "missing")
     unknown = sum(1 for d in results if d["monitoring_status"] == "unknown")
+    high_memory = sum(1 for d in results if (d.get("memory_percent") or 0) > 85)
+    high_disk   = sum(1 for d in results if (d.get("disk_percent")   or 0) > 85)
 
     return MonitoringCoverageResponse(
         total_droplets=len(results),
         monitoring_enabled=enabled,
         monitoring_missing=missing,
         monitoring_unknown=unknown,
+        high_memory=high_memory,
+        high_disk=high_disk,
         droplets=[MonitoringDropletItem(**d) for d in results],
     )
 
@@ -397,9 +401,9 @@ async def analyze_project(
         try:
             monitoring_data = await asyncio.wait_for(
                 MonitoringScanner(config.DIGITALOCEAN_TOKEN).scan_all_droplets_monitoring(
-                    droplet_dicts
+                    droplet_dicts, coverage_only=True
                 ),
-                timeout=30.0,
+                timeout=60.0,
             )
             missing_count = sum(1 for d in monitoring_data if d["monitoring_status"] == "missing")
             unknown_count = sum(1 for d in monitoring_data if d["monitoring_status"] == "unknown")
@@ -409,7 +413,7 @@ async def analyze_project(
             )
         except asyncio.TimeoutError:
             logger.warning(
-                f"[{analysis_id}] Monitoring scan timed out (30 s) — skipping for this analysis"
+                f"[{analysis_id}] Monitoring scan timed out (60 s) — skipping for this analysis"
             )
         except Exception as exc:
             logger.warning(

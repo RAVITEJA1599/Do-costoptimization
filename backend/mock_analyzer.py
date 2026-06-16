@@ -13,6 +13,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from rule_engine import _detect_effective_environment, _PROD_LIKE_ENVS
+
 logger = logging.getLogger(__name__)
 
 # ── DigitalOcean pricing (USD/month) ─────────────────────────────────────────
@@ -251,13 +253,17 @@ class MockAnalyzer:
             vcpus = d.get("vcpus", 0)
             mem_gb = round(d.get("memory", 0) / 1024, 0)
             did = d.get("id", "<droplet-id>")
+            name = d.get("name", "unnamed-droplet")
+            env = _detect_effective_environment(name, d.get("tags"))
 
             if vcpus >= 8:
+                if env in _PROD_LIKE_ENVS:
+                    continue
                 mo_current = int(vcpus * _PRICE_VCPU_ESTIMATE)
                 mo_smaller = int((vcpus // 2) * _PRICE_VCPU_ESTIMATE)
                 savings = mo_current - mo_smaller
                 out.append(_finding(
-                    name=d.get("name", "unnamed-droplet"),
+                    name=name,
                     rtype="droplet",
                     severity="medium",
                     issue=f"Large Droplet ({vcpus} vCPUs / {mem_gb:.0f} GB RAM) — verify utilization before next billing cycle",
@@ -271,23 +277,22 @@ class MockAnalyzer:
                     ],
                 ))
             elif vcpus >= 4:
-                tags = d.get("tags", [])
-                is_prod = any("prod" in t.lower() for t in tags)
-                if not is_prod:
-                    out.append(_finding(
-                        name=d.get("name", "unnamed-droplet"),
-                        rtype="droplet",
-                        severity="low",
-                        issue=f"Droplet ({vcpus} vCPUs / {mem_gb:.0f} GB) has no 'production' tag — may be over-provisioned for dev/staging",
-                        monthly=12,
-                        recommendation="Review workload requirements and downsize if this is a non-production server",
-                        steps=[
-                            f"Review Droplet details: doctl compute droplet get {did}",
-                            f"Power off: doctl compute droplet-action power-off {did}",
-                            f"Resize to a smaller plan: doctl compute droplet-action resize {did} --size s-2vcpu-4gb",
-                            f"Power on: doctl compute droplet-action power-on {did}",
-                        ],
-                    ))
+                if env in _PROD_LIKE_ENVS:
+                    continue
+                out.append(_finding(
+                    name=name,
+                    rtype="droplet",
+                    severity="low",
+                    issue=f"Droplet ({vcpus} vCPUs / {mem_gb:.0f} GB) — may be over-provisioned for {env.lower() if env != 'UNKNOWN' else 'non-production'} environment",
+                    monthly=12,
+                    recommendation="Review workload requirements and downsize if this is a non-production server",
+                    steps=[
+                        f"Review Droplet details: doctl compute droplet get {did}",
+                        f"Power off: doctl compute droplet-action power-off {did}",
+                        f"Resize to a smaller plan: doctl compute droplet-action resize {did} --size s-2vcpu-4gb",
+                        f"Power on: doctl compute droplet-action power-on {did}",
+                    ],
+                ))
         return out
 
 
