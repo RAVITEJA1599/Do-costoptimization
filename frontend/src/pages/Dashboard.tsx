@@ -98,9 +98,15 @@ function RecentAnalyses({ items }: { items: HistoryItem[] }) {
 
 const ENV_STYLES: Record<string, string> = {
   PROD:    'bg-rose-500/15 border-rose-500/30 text-rose-400',
+  DR:      'bg-pink-500/15 border-pink-500/30 text-pink-400',
   STAGING: 'bg-orange-500/15 border-orange-500/30 text-orange-400',
+  UAT:     'bg-yellow-500/15 border-yellow-500/30 text-yellow-400',
   QA:      'bg-amber-500/15 border-amber-500/30 text-amber-400',
+  TEST:    'bg-amber-500/15 border-amber-500/30 text-amber-400',
+  DEMO:    'bg-cyan-500/15 border-cyan-500/30 text-cyan-400',
   DEV:     'bg-slate-700/60 border-slate-600/40 text-slate-400',
+  POC:     'bg-violet-500/15 border-violet-500/30 text-violet-400',
+  BACKUP:  'bg-slate-600/30 border-slate-500/30 text-slate-500',
 }
 
 function EnvBadge({ env }: { env: string }) {
@@ -170,13 +176,6 @@ function fleetSortKey(d: MonitoringDropletItem): number {
   return 7                                          // healthy
 }
 
-function sortedFleetDroplets(droplets: MonitoringDropletItem[]): MonitoringDropletItem[] {
-  return [...droplets].sort((a, b) => {
-    const diff = fleetSortKey(a) - fleetSortKey(b)
-    return diff !== 0 ? diff : a.droplet_name.localeCompare(b.droplet_name)
-  })
-}
-
 // ── Main page ──────────────────────────────────────────────────────────────────
 
 export default function Dashboard() {
@@ -196,8 +195,49 @@ export default function Dashboard() {
   const [monitoringLoading, setMonitoringLoading] = useState(false)
   const [monitoringError, setMonitoringError] = useState('')
 
+  const [fleetSearch, setFleetSearch] = useState('')
+  const [fleetEnvFilter, setFleetEnvFilter] = useState('all')
+  const [fleetAgentFilter, setFleetAgentFilter] = useState('all')
+  const [fleetSortCol, setFleetSortCol] = useState<'priority' | 'name' | 'env' | 'memory' | 'disk'>('priority')
+  const [fleetSortDir, setFleetSortDir] = useState<'asc' | 'desc'>('asc')
+
   const analysisRef = useRef<AbortController | null>(null)
   const navigate = useNavigate()
+
+  function handleFleetSort(col: 'name' | 'env' | 'memory' | 'disk') {
+    if (fleetSortCol === col) {
+      setFleetSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setFleetSortCol(col)
+      setFleetSortDir(col === 'memory' || col === 'disk' ? 'desc' : 'asc')
+    }
+  }
+
+  const fleetEnvOptions = monitoringData
+    ? ['all', ...Array.from(new Set(monitoringData.droplets.map(d => d.environment ?? 'unknown'))).sort()]
+    : ['all']
+
+  const fleetDisplayDroplets = (() => {
+    if (!monitoringData) return []
+    let list = [...monitoringData.droplets]
+    if (fleetSearch) {
+      const q = fleetSearch.toLowerCase()
+      list = list.filter(d => d.droplet_name.toLowerCase().includes(q))
+    }
+    if (fleetEnvFilter !== 'all') list = list.filter(d => (d.environment ?? 'unknown') === fleetEnvFilter)
+    if (fleetAgentFilter !== 'all') list = list.filter(d => d.monitoring_status === fleetAgentFilter)
+    list.sort((a, b) => {
+      let cmp = 0
+      if (fleetSortCol === 'priority') cmp = fleetSortKey(a) - fleetSortKey(b)
+      else if (fleetSortCol === 'name') cmp = a.droplet_name.localeCompare(b.droplet_name)
+      else if (fleetSortCol === 'env') cmp = (a.environment ?? 'unknown').localeCompare(b.environment ?? 'unknown')
+      else if (fleetSortCol === 'memory') cmp = (a.memory_percent ?? -1) - (b.memory_percent ?? -1)
+      else if (fleetSortCol === 'disk') cmp = (a.disk_percent ?? -1) - (b.disk_percent ?? -1)
+      if (cmp === 0) cmp = a.droplet_name.localeCompare(b.droplet_name)
+      return fleetSortDir === 'asc' ? cmp : -cmp
+    })
+    return list
+  })()
 
   // Fetch project list
   useEffect(() => {
@@ -206,7 +246,12 @@ export default function Dashboard() {
         setProjects(data.projects)
         if (data.projects.length > 0) setSelectedProject(data.projects[0].id)
       })
-      .catch(() => setError('Failed to load projects. Check your DigitalOcean token.'))
+      .catch((err: any) => {
+        const status = err?.response?.status
+        if (status === 429) setError('DigitalOcean API rate limit hit — please wait a few seconds and refresh.')
+        else if (status === 401) setError('Invalid DigitalOcean token. Check your .env file.')
+        else setError('Failed to load projects. Check your DigitalOcean token and network connection.')
+      })
       .finally(() => setLoadingProjects(false))
   }, [])
 
@@ -639,6 +684,56 @@ export default function Dashboard() {
                 </div>
               </div>
 
+              {/* Filter bar */}
+              {monitoringData.total_droplets > 0 && (
+                <div className="flex flex-wrap items-center gap-2">
+                  {/* Search */}
+                  <input
+                    type="text"
+                    placeholder="Search droplets…"
+                    value={fleetSearch}
+                    onChange={e => setFleetSearch(e.target.value)}
+                    className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 placeholder-slate-600 w-36 focus:outline-none focus:border-blue-500/50"
+                  />
+                  {/* ENV filter */}
+                  <select
+                    value={fleetEnvFilter}
+                    onChange={e => setFleetEnvFilter(e.target.value)}
+                    className="bg-slate-800 border border-slate-700 rounded px-2 py-1 text-xs text-slate-300 focus:outline-none focus:border-blue-500/50"
+                  >
+                    {fleetEnvOptions.map(env => (
+                      <option key={env} value={env}>{env === 'all' ? 'All Envs' : env}</option>
+                    ))}
+                  </select>
+                  {/* Agent filter */}
+                  {(['all', 'enabled', 'missing'] as const).map(f => (
+                    <button
+                      key={f}
+                      onClick={() => setFleetAgentFilter(f)}
+                      className={`text-xs px-2 py-1 rounded border transition-colors ${
+                        fleetAgentFilter === f
+                          ? 'bg-blue-600/25 border-blue-500/50 text-blue-300'
+                          : 'bg-slate-800 border-slate-700 text-slate-400 hover:border-slate-500 hover:text-slate-300'
+                      }`}
+                    >
+                      {f === 'all' ? 'All' : f === 'enabled' ? '● On' : '● Missing'}
+                    </button>
+                  ))}
+                  {/* Clear */}
+                  {(fleetSearch || fleetEnvFilter !== 'all' || fleetAgentFilter !== 'all') && (
+                    <button
+                      onClick={() => { setFleetSearch(''); setFleetEnvFilter('all'); setFleetAgentFilter('all') }}
+                      className="text-xs px-2 py-1 rounded border border-slate-700 text-slate-500 hover:text-slate-300 hover:border-slate-500 transition-colors"
+                    >
+                      Clear
+                    </button>
+                  )}
+                  <span className="ml-auto text-xs text-slate-600">
+                    {fleetDisplayDroplets.length} / {monitoringData.total_droplets}
+                  </span>
+                </div>
+              )}
+
               {/* Droplet table */}
               {monitoringData.total_droplets === 0 ? (
                 <p className="text-sm text-slate-500 text-center py-2">No Droplets found in this project.</p>
@@ -648,25 +743,37 @@ export default function Dashboard() {
                     <table className="w-full text-sm">
                       <thead className="sticky top-0 bg-slate-800/90 backdrop-blur-sm">
                         <tr className="border-b border-slate-700/70">
-                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                            Droplet
-                          </th>
-                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider hidden sm:table-cell">
-                            Env
-                          </th>
-                          <th className="text-left px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                            Agent
-                          </th>
-                          <th className="text-right px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider hidden md:table-cell">
-                            Memory
-                          </th>
-                          <th className="text-right px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider">
-                            Disk
-                          </th>
+                          {([
+                            { col: 'name',   label: 'Droplet', align: 'left',  cls: '' },
+                            { col: 'env',    label: 'Env',     align: 'left',  cls: 'hidden sm:table-cell' },
+                            { col: null,     label: 'Agent',   align: 'left',  cls: '' },
+                            { col: 'memory', label: 'Memory',  align: 'right', cls: 'hidden md:table-cell' },
+                            { col: 'disk',   label: 'Disk',    align: 'right', cls: '' },
+                          ] as const).map(({ col, label, align, cls }) => (
+                            <th
+                              key={label}
+                              onClick={col ? () => handleFleetSort(col as 'name' | 'env' | 'memory' | 'disk') : undefined}
+                              className={`px-3 py-2 text-xs font-semibold text-slate-400 uppercase tracking-wider ${cls} ${col ? 'cursor-pointer hover:text-slate-200 select-none' : ''} text-${align}`}
+                            >
+                              {label}
+                              {col && fleetSortCol === col && (
+                                <span className="ml-1 opacity-70">{fleetSortDir === 'asc' ? '↑' : '↓'}</span>
+                              )}
+                              {col && fleetSortCol !== col && (
+                                <span className="ml-1 opacity-20">↕</span>
+                              )}
+                            </th>
+                          ))}
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-700/40">
-                        {sortedFleetDroplets(monitoringData.droplets).map((d) => (
+                        {fleetDisplayDroplets.length === 0 ? (
+                          <tr>
+                            <td colSpan={5} className="px-3 py-6 text-center text-xs text-slate-500">
+                              No droplets match the current filters.
+                            </td>
+                          </tr>
+                        ) : fleetDisplayDroplets.map((d) => (
                           <tr key={d.droplet_id} className="hover:bg-slate-700/20 transition-colors">
                             <td className="px-3 py-2 text-slate-300 font-mono text-xs max-w-[160px] truncate" title={d.droplet_name}>
                               {d.droplet_name}

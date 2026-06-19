@@ -41,20 +41,26 @@ logger = logging.getLogger(__name__)
 
 _DO_API_BASE = "https://api.digitalocean.com/v2"
 _REQUEST_TIMEOUT = 15   # seconds per call — short so a hung call doesn't block the pipeline
-_CONCURRENCY = 10       # Fleet Health makes up to 5 calls per enabled droplet (cpu + 2 memory + 2 disk)
+_CONCURRENCY = 5        # lower burst rate to stay under DO's 5 000 req/hour limit
+_MAX_RETRY_SLEEP = 30   # cap the retry-after sleep so scans don't hang for a full window reset
 
 # Lowercase keyword → canonical environment label
 _ENV_MAP: Dict[str, str] = {
     "prod":        "PROD",
     "production":  "PROD",
+    "dr":          "DR",
     "dev":         "DEV",
     "development": "DEV",
     "qa":          "QA",
-    "test":        "QA",
-    "testing":     "QA",
+    "test":        "TEST",
+    "testing":     "TEST",
     "staging":     "STAGING",
     "stage":       "STAGING",
     "stg":         "STAGING",
+    "uat":         "UAT",
+    "demo":        "DEMO",
+    "poc":         "POC",
+    "backup":      "BACKUP",
 }
 
 
@@ -107,51 +113,61 @@ class MonitoringScanner:
         """
         end_ts = int(time.time())
         start_ts = end_ts - 6 * 3600
+        retry_delay = 0
 
-        async with semaphore:
-            try:
-                resp = await client.get(
-                    f"{_DO_API_BASE}/monitoring/metrics/droplet/cpu",
-                    headers=self._headers,
-                    params={"host_id": droplet_id, "start": start_ts, "end": end_ts},
-                    timeout=_REQUEST_TIMEOUT,
-                )
+        for attempt in range(3):
+            if retry_delay:
+                await asyncio.sleep(retry_delay)
+                retry_delay = 0
 
-                if resp.status_code == 401:
-                    raise ValueError("Invalid DigitalOcean API token")
-                if resp.status_code == 429:
+            async with semaphore:
+                try:
+                    resp = await client.get(
+                        f"{_DO_API_BASE}/monitoring/metrics/droplet/cpu",
+                        headers=self._headers,
+                        params={"host_id": droplet_id, "start": start_ts, "end": end_ts},
+                        timeout=_REQUEST_TIMEOUT,
+                    )
+
+                    if resp.status_code == 401:
+                        raise ValueError("Invalid DigitalOcean API token")
+
+                    if resp.status_code == 429:
+                        retry_delay = min(int(resp.headers.get("retry-after", "10")), _MAX_RETRY_SLEEP)
+                        logger.warning(
+                            "Rate limit checking monitoring for droplet %s — retry in %ds (attempt %d/3)",
+                            droplet_id, retry_delay, attempt + 1,
+                        )
+                        continue  # release semaphore, sleep at top of next iteration
+
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "Monitoring API returned HTTP %s for droplet %s — status unknown",
+                            resp.status_code, droplet_id,
+                        )
+                        return "unknown"
+
+                    body = resp.json()
+                    data_section = body.get("data") or {}
+                    result = data_section.get("result", [])
+                    return "enabled" if len(result) > 0 else "missing"
+
+                except ValueError:
+                    raise
+                except httpx.TimeoutException:
                     logger.warning(
-                        "Monitoring API rate limit hit for droplet %s — status unknown", droplet_id
+                        "Timeout checking monitoring for droplet %s — status unknown", droplet_id
                     )
                     return "unknown"
-                if resp.status_code != 200:
+                except httpx.NetworkError as exc:
                     logger.warning(
-                        "Monitoring API returned HTTP %s for droplet %s — status unknown",
-                        resp.status_code,
-                        droplet_id,
+                        "Network error checking monitoring for droplet %s: %s — status unknown",
+                        droplet_id, exc,
                     )
                     return "unknown"
 
-                body = resp.json()
-                # Use `or {}` to handle a null "data" field gracefully
-                data_section = body.get("data") or {}
-                result = data_section.get("result", [])
-                return "enabled" if len(result) > 0 else "missing"
-
-            except ValueError:
-                raise
-            except httpx.TimeoutException:
-                logger.warning(
-                    "Timeout checking monitoring for droplet %s — status unknown", droplet_id
-                )
-                return "unknown"
-            except httpx.NetworkError as exc:
-                logger.warning(
-                    "Network error checking monitoring for droplet %s: %s — status unknown",
-                    droplet_id,
-                    exc,
-                )
-                return "unknown"
+        logger.warning("Rate limit exhausted for droplet %s monitoring check — status unknown", droplet_id)
+        return "unknown"
 
     async def _fetch_metric_series(
         self,
@@ -171,50 +187,67 @@ class MonitoringScanner:
         """
         end_ts = int(time.time())
         start_ts = end_ts - 6 * 3600
+        retry_delay = 0
 
-        async with semaphore:
-            try:
-                resp = await client.get(
-                    f"{_DO_API_BASE}{endpoint}",
-                    headers=self._headers,
-                    params={"host_id": droplet_id, "start": start_ts, "end": end_ts},
-                    timeout=_REQUEST_TIMEOUT,
-                )
+        for attempt in range(3):
+            if retry_delay:
+                await asyncio.sleep(retry_delay)
+                retry_delay = 0
 
-                if resp.status_code != 200:
-                    logger.warning(
-                        "Metric %s returned HTTP %s for droplet %s — skipping",
-                        endpoint, resp.status_code, droplet_id,
+            async with semaphore:
+                try:
+                    resp = await client.get(
+                        f"{_DO_API_BASE}{endpoint}",
+                        headers=self._headers,
+                        params={"host_id": droplet_id, "start": start_ts, "end": end_ts},
+                        timeout=_REQUEST_TIMEOUT,
                     )
-                    return None
 
-                body = resp.json()
-                result = (body.get("data") or {}).get("result", [])
-                if not result:
+                    if resp.status_code == 429:
+                        retry_delay = min(int(resp.headers.get("retry-after", "10")), _MAX_RETRY_SLEEP)
+                        logger.warning(
+                            "Rate limit on %s droplet %s — retry in %ds (attempt %d/3)",
+                            endpoint, droplet_id, retry_delay, attempt + 1,
+                        )
+                        continue  # release semaphore, sleep at top of next iteration
+
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "Metric %s returned HTTP %s for droplet %s — skipping",
+                            endpoint, resp.status_code, droplet_id,
+                        )
+                        return None
+
+                    body = resp.json()
+                    result = (body.get("data") or {}).get("result", [])
+                    if not result:
+                        logger.debug(
+                            "Metric %s returned empty result for droplet %s "
+                            "(agent installed but no data yet)",
+                            endpoint, droplet_id,
+                        )
+                        return None
+
+                    return result
+
+                except httpx.TimeoutException:
                     logger.debug(
-                        "Metric %s returned empty result for droplet %s "
-                        "(agent installed but no data yet)",
-                        endpoint, droplet_id,
+                        "Timeout fetching metric %s for droplet %s — skipping", endpoint, droplet_id
+                    )
+                    return None
+                except httpx.NetworkError as exc:
+                    logger.debug(
+                        "Network error fetching metric %s for droplet %s: %s", endpoint, droplet_id, exc
+                    )
+                    return None
+                except Exception as exc:
+                    logger.debug(
+                        "Unexpected error fetching metric %s for droplet %s: %s", endpoint, droplet_id, exc
                     )
                     return None
 
-                return result
-
-            except httpx.TimeoutException:
-                logger.debug(
-                    "Timeout fetching metric %s for droplet %s — skipping", endpoint, droplet_id
-                )
-                return None
-            except httpx.NetworkError as exc:
-                logger.debug(
-                    "Network error fetching metric %s for droplet %s: %s", endpoint, droplet_id, exc
-                )
-                return None
-            except Exception as exc:
-                logger.debug(
-                    "Unexpected error fetching metric %s for droplet %s: %s", endpoint, droplet_id, exc
-                )
-                return None
+        logger.warning("Rate limit exhausted for %s droplet %s — no data", endpoint, droplet_id)
+        return None
 
     async def _get_metric_pct(
         self,
